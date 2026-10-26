@@ -98,9 +98,8 @@ main{padding:16px 18px}
 .stats{margin-left:auto;color:var(--muted);font-size:12px}
 .stats b{color:var(--text)}
 
-/* ---------- 캐릭터 카드: 넓은 화면에서 한 줄 5개 ---------- */
-#grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;align-items:start}
-@media (max-width:1500px){ #grid{grid-template-columns:repeat(4,minmax(0,1fr))} }
+/* ---------- 캐릭터 카드: 넓은 화면에서 한 줄 4개 ---------- */
+#grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;align-items:start}
 @media (max-width:1200px){ #grid{grid-template-columns:repeat(3,minmax(0,1fr))} }
 @media (max-width:900px) { #grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
 @media (max-width:600px) { #grid{grid-template-columns:1fr} }
@@ -250,8 +249,8 @@ details.log li b{color:var(--text);font-weight:500}
     <textarea id="cfgText" placeholder='const firebaseConfig = {
   apiKey: "...",
   authDomain: "...",
-  databaseURL: "https://xxxx-default-rtdb.asia-southeast1.firebasedatabase.app",
   projectId: "...",
+  storageBucket: "...",
   ...
 };'></textarea>
     <div class="err" id="cfgErr"></div>
@@ -379,12 +378,29 @@ details.log li b{color:var(--text);font-weight:500}
    - 나중에 Firebase를 쓰려면 관리자 → [Firebase 연결 설정]에서 설정을 넣거나,
      아래 EMBEDDED_CONFIG 에 firebaseConfig 를 넣어두면 됩니다.
 ===================================================================== */
-const EMBEDDED_CONFIG = null;
+/* GitHub Pages 에 올릴 때: Firebase 콘솔의 firebaseConfig 를 아래 null 자리에 붙여넣으세요.
+   예)
+   const EMBEDDED_CONFIG = {
+     apiKey: "AIza....",
+     authDomain: "r2-cash.firebaseapp.com",
+     projectId: "r2-cash",
+     appId: "1:123:web:abc"
+   };
+   ※ apiKey 는 공개돼도 괜찮은 값입니다. 데이터 모양 검사는 보안 규칙(firestore.rules)이 담당합니다. */
+const EMBEDDED_CONFIG = {
+  apiKey: "AIzaSyB596GHLV4Zzl0kNp-Duc2FGeFWTWTORNI",
+  authDomain: "jins-projectm.firebaseapp.com",
+  projectId: "jins-projectm",
+  storageBucket: "jins-projectm.firebasestorage.app",
+  messagingSenderId: "608147968494",
+  appId: "1:608147968494:web:bea3aef776fda56c57feff",
+  measurementId: "G-1CN5F8FTM6"
+};
 
 const APP_ID = "r2-item-timer";   // JSON 파일이 이 프로그램 것인지 확인하는 표시
 const DATA_VERSION = 2;            // v2: 연장 횟수(count), 악세사리 여러 개
 const LOCAL_KEY = "r2_local_data"; // 로컬 모드 자동 저장 위치
-const DB_ROOT = "r2timer";         // Firebase 안에서 쓸 폴더 이름
+const ROOM_ID = "r2-main-room";   // 모두가 함께 쓰는 고정 저장 위치 (Firestore: r2rooms/r2-main-room)
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
@@ -612,7 +628,12 @@ function createLocalStore(){
   };
 }
 
-/* ---------- 3-2. Firebase 저장소 (나중에 사용) ---------- */
+/* ---------- 3-2. Firebase 저장소 (Cloud Firestore) ----------
+   Firestore 안의 저장 구조
+     r2rooms/r2-main-room                      ← 문서: { adminHash }
+     r2rooms/r2-main-room/characters/{캐릭터ID} ← 문서: { name, memo, items, updatedBy, updatedAt }
+     r2rooms/r2-main-room/logs/{자동ID}         ← 문서: { at, by, text }
+------------------------------------------------------------- */
 function loadScript(src){
   return new Promise((ok, fail) => {
     const s = document.createElement("script");
@@ -620,66 +641,132 @@ function loadScript(src){
     document.head.appendChild(s);
   });
 }
-function createFirebaseStore(cfg){
-  let db = null;
-  const R = p => db.ref(DB_ROOT + (p ? "/" + p : ""));
-  const TS = () => firebase.database.ServerValue.TIMESTAMP;
-  function log(text){ R("logs").push({ at: TS(), by: nick(), text }); }
+const FS_ROOT = "r2rooms";   // Firestore 최상위 컬렉션 이름 (보안 규칙과 같아야 함)
+
+// Firestore에 저장할 캐릭터 모양만 남기기 (이상한 값이 섞여 규칙에 막히지 않도록)
+function cleanChar(c){
+  return { name: String(c.name || "").slice(0,20), memo: String(c.memo || "").slice(0,30),
+           items: c.items || {}, updatedBy: nick().slice(0,15) };
+}
+
+function createFirebaseStore(cfg, room){
+  let db = null, roomRef = null, charCol = null, logCol = null;
+  const SVT = () => firebase.firestore.FieldValue.serverTimestamp();
+  function log(text){
+    return logCol.add({ at: SVT(), by: nick().slice(0,15), text: String(text).slice(0,100) })
+      .catch(e => console.warn("기록 저장 실패", e));
+  }
+  function permHint(err){
+    return err && err.code === "permission-denied"
+      ? "권한이 없습니다. Firestore → 규칙(Rules)에 firestore.rules 내용을 붙여넣고 게시했는지 확인하세요."
+      : (err && err.message) || String(err);
+  }
 
   return {
     mode: "firebase",
     async start(){
-      setConn("", "Firebase 연결 중…");
+      setConn("", "Firestore 연결 중…");
       // Firebase 라이브러리는 이 모드일 때만 인터넷에서 불러옵니다 (로컬 모드는 오프라인 가능)
       await loadScript("https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js");
-      await loadScript("https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js");
+      await loadScript("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js");
       firebase.initializeApp(cfg);
-      db = firebase.database();
+      db = firebase.firestore();
+      roomRef = db.collection(FS_ROOT).doc(room);
+      charCol = roomRef.collection("characters");
+      logCol = roomRef.collection("logs");
 
-      db.ref(".info/connected").on("value", s => {
-        const on = s.val() === true;
-        setConn(on ? "on" : "", on ? "Firebase 실시간 연결됨" : "연결 끊김 (재연결 시도 중)");
+      // 캐릭터 목록 실시간 수신 — 누군가 바꾸면 모두의 화면이 자동 갱신됩니다
+      charCol.onSnapshot({ includeMetadataChanges: true }, snap => {
+        const next = {};
+        snap.forEach(d => { next[d.id] = d.data(); });
+        chars = next; renderAll();
+        setConn(snap.metadata.fromCache ? "" : "on",
+                snap.metadata.fromCache ? "Firestore 연결 확인 중…" : "Firestore 실시간 연결됨");
+      }, err => {
+        setConn("", "연결 실패");
+        $("grid").innerHTML = `<div class="empty">데이터를 읽을 수 없습니다.<br>${esc(permHint(err))}</div>`;
       });
-      db.ref(".info/serverTimeOffset").on("value", s => { serverOffset = s.val() || 0; });
-      R("characters").on("value", s => { chars = s.val() || {}; renderAll(); }, err => {
-        $("grid").innerHTML = `<div class="empty">데이터를 읽을 수 없습니다: ${esc(err.message)}<br>
-          Firebase 콘솔 → Realtime Database → 규칙(Rules)에서 읽기/쓰기 권한을 확인하세요.</div>`;
-      });
-      R("settings/adminHash").on("value", s => { adminHash = s.val(); });
-      R("logs").limitToLast(40).on("value", s => {
-        logs = []; s.forEach(c => { logs.push(c.val()); }); logs.reverse(); renderLogs();
-      });
+
+      roomRef.onSnapshot(d => { adminHash = d.exists ? (d.data().adminHash || null) : null; },
+                         err => console.warn(err));
+
+      logCol.orderBy("at", "desc").limit(40).onSnapshot(snap => {
+        logs = [];
+        snap.forEach(d => {
+          const v = d.data({ serverTimestamps: "estimate" });
+          logs.push({ at: v.at && v.at.toMillis ? v.at.toMillis() : Date.now(), by: v.by, text: v.text });
+        });
+        renderLogs();
+      }, err => console.warn(err));
     },
+
     saveChar(id, c, logText){
-      const ref = id ? R("characters/" + id) : R("characters").push();
-      return ref.set(Object.assign({}, c, { updatedAt: TS() })).then(() => log(logText));
+      const ref = id ? charCol.doc(id) : charCol.doc();
+      return ref.set(Object.assign(cleanChar(c), { updatedAt: SVT() }))
+        .then(() => log(logText)).catch(e => { throw new Error(permHint(e)); });
     },
-    removeChar(id, logText){ return R("characters/" + id).remove().then(() => log(logText)); },
+
+    removeChar(id, logText){
+      return charCol.doc(id).delete().then(() => log(logText)).catch(e => { throw new Error(permHint(e)); });
+    },
+
+    // transaction: 두 사람이 동시에 눌러도 한 번만 연장되도록 서버 값으로 다시 확인
     extend(id, key){
-      // transaction: 두 사람이 동시에 눌러도 한 번만 연장되도록 서버 값으로 다시 확인
-      return R(`characters/${id}/items/${key}`).transaction(cur => {
-        if (!cur || !canExtend(defFor(key, cur), cur)) return;   // undefined = 취소
-        return Object.assign({}, cur, { expireAt: cur.expireAt + EXTEND_MS, count: (cur.count || 0) + 1 });
-      }).then(r => {
-        if (!r.committed) return null;
-        const it = r.snapshot.val(), def = defFor(key, it);
-        log(`${chars[id]?.name}의 ${def.name}을(를) ${def.tool}로 7일 연장 (${it.count}회째)`);
+      const ref = charCol.doc(id);
+      return db.runTransaction(async tx => {
+        const snap = await tx.get(ref);
+        if (!snap.exists) return null;
+        const cur = (snap.data().items || {})[key];
+        if (!cur || !canExtend(defFor(key, cur), cur)) return null;
+        const next = Object.assign({}, cur, { expireAt: cur.expireAt + EXTEND_MS, count: (cur.count || 0) + 1 });
+        tx.update(ref, { [`items.${key}.expireAt`]: next.expireAt, [`items.${key}.count`]: next.count });
+        return next;
+      }).then(it => {
+        if (it){
+          const def = defFor(key, it);
+          log(`${chars[id]?.name}의 ${def.name}을(를) ${def.tool}로 7일 연장 (${it.count}회째)`);
+        }
         return it;
-      });
+      }).catch(e => { throw new Error(permHint(e)); });
     },
-    bulkAdd(list, ms, logText){
-      const updates = {};
-      list.forEach(t => { updates[`characters/${t.id}/items/${t.key}/expireAt`] = t.expireAt + ms; });
-      return R().update(updates).then(() => log(logText));
+
+    // 일괄 시간 증가: 캐릭터별로 한 번씩 수정 (Firestore 한 묶음은 최대 500개)
+    async bulkAdd(list, ms, logText){
+      const byChar = {};
+      list.forEach(t => { (byChar[t.id] = byChar[t.id] || {})[`items.${t.key}.expireAt`] = t.expireAt + ms; });
+      const ids = Object.keys(byChar);
+      for (let i = 0; i < ids.length; i += 400){
+        const batch = db.batch();
+        ids.slice(i, i + 400).forEach(id => batch.update(charCol.doc(id), byChar[id]));
+        await batch.commit().catch(e => { throw new Error(permHint(e)); });
+      }
+      log(logText);
     },
+
     setAdminHash(h, onlyIfEmpty, logText){
-      return R("settings/adminHash").transaction(cur => (onlyIfEmpty && cur) ? undefined : h)
-        .then(r => { if (r.committed) log(logText); return r.committed; });
+      return db.runTransaction(async tx => {
+        const snap = await tx.get(roomRef);
+        if (onlyIfEmpty && snap.exists && snap.data().adminHash) return false;
+        tx.set(roomRef, { adminHash: h });
+        return true;
+      }).then(ok => { if (ok) log(logText); return ok; })
+        .catch(e => { throw new Error(permHint(e)); });
     },
-    replaceAll(newChars, newHash, logText){
-      const updates = { characters: newChars };
-      if (newHash !== undefined) updates["settings/adminHash"] = newHash;
-      return R().update(updates).then(() => log(logText));
+
+    // JSON 불러오기: 파일에 없는 캐릭터는 지우고, 파일 내용으로 저장
+    async replaceAll(newChars, newHash, logText){
+      const ops = [];
+      Object.keys(chars).forEach(id => { if (!newChars[id]) ops.push(b => b.delete(charCol.doc(id))); });
+      Object.entries(newChars).forEach(([id, c]) => {
+        ops.push(b => b.set(charCol.doc(id), Object.assign(cleanChar(c), { updatedAt: SVT() })));
+      });
+      for (let i = 0; i < ops.length; i += 400){
+        const batch = db.batch();
+        ops.slice(i, i + 400).forEach(fn => fn(batch));
+        await batch.commit().catch(e => { throw new Error(permHint(e)); });
+      }
+      if (newHash !== undefined) await roomRef.set({ adminHash: newHash }).catch(e => { throw new Error(permHint(e)); });
+      log(logText);
     },
   };
 }
@@ -1107,9 +1194,9 @@ function openAdmin(){
   const isLocal = Store.mode === "local";
   $("modeDesc").textContent = isLocal
     ? "지금은 로컬 모드입니다. 데이터는 이 브라우저에만 저장되며, 다른 사람과는 JSON 파일로 주고받습니다."
-    : "지금은 Firebase 모드입니다. 같은 설정을 쓰는 모든 사람이 실시간으로 같은 데이터를 봅니다.";
+    : "지금은 Firebase 모드입니다. 이 페이지에 접속한 모든 사람이 실시간으로 같은 데이터를 봅니다.";
   $("btnFbSetup").style.display = isLocal ? "" : "none";
-  $("btnToLocal").style.display = isLocal ? "none" : "";
+  $("btnToLocal").style.display = isLocal || EMBEDDED_CONFIG ? "none" : "";
   updatePreview();
   showModal("mAdmin");
 }
@@ -1185,10 +1272,18 @@ function changePw(){
 
 /* Firebase 설정 붙여넣기 → 객체로 변환 */
 function parseConfigText(txt){
-  const a = txt.indexOf("{"), b = txt.lastIndexOf("}");
-  if (a < 0 || b < a) throw new Error("{ } 로 감싸진 설정을 찾지 못했습니다.");
+  // Firebase 화면의 코드를 통째로 붙여넣어도 되도록, apiKey 가 들어 있는 { } 블록만 골라냅니다
+  const k = txt.indexOf("apiKey");
+  if (k < 0) throw new Error("apiKey 항목을 찾지 못했습니다. firebaseConfig 코드를 붙여넣어 주세요.");
+  const a = txt.lastIndexOf("{", k);
+  let depth = 0, b = -1;
+  for (let i = a; i < txt.length; i++){
+    if (txt[i] === "{") depth++;
+    else if (txt[i] === "}" && --depth === 0){ b = i; break; }
+  }
+  if (a < 0 || b < 0) throw new Error("{ } 로 감싸진 설정을 찾지 못했습니다.");
   const obj = new Function("return (" + txt.slice(a, b+1) + ");")();
-  if (!obj.databaseURL) throw new Error("databaseURL 항목이 없습니다. Realtime Database를 먼저 만들어주세요.");
+  if (!obj.projectId) throw new Error("projectId 항목이 없습니다. firebaseConfig 전체를 복사했는지 확인하세요.");
   if (!obj.apiKey) throw new Error("apiKey 항목이 없습니다.");
   return obj;
 }
@@ -1254,7 +1349,8 @@ $("nickView").textContent = localStorage.getItem("r2_nick") || "미설정";
   if (!cfg){ try { cfg = JSON.parse(localStorage.getItem("r2_fbcfg") || "null"); } catch(e){ cfg = null; } }
 
   if (cfg){
-    Store = createFirebaseStore(cfg);
+    // 입장 코드 없이 바로 공용 저장 위치에 연결합니다
+    Store = createFirebaseStore(cfg, ROOM_ID);
     Store.start().catch(e => {
       // Firebase 실패 시 로컬 모드로 자동 전환 → 프로그램은 계속 쓸 수 있습니다
       console.error(e);
